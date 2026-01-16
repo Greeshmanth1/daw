@@ -39,7 +39,6 @@ class RideRequest(BaseModel):
     rider_id: int
     pickup_lat: float
     pickup_long: float
-    # In real app: drop_lat, drop_long, tier
 
 class TripAction(BaseModel):
     ride_id: int
@@ -61,9 +60,10 @@ class ConnectionManager:
                 pass
 manager = ConnectionManager()
 
-# --- HELPER: Haversine Distance (Lat/Long to KM) ---
+# --- HELPER: Haversine Distance ---
 def calculate_distance(lat1, lon1, lat2, lon2):
-    R = 6371  # Earth radius in km
+    if lat1 is None or lon1 is None: return 0 # Safety check
+    R = 6371 
     dLat = math.radians(lat2 - lat1)
     dLon = math.radians(lon2 - lon1)
     a = math.sin(dLat/2) * math.sin(dLat/2) + \
@@ -79,10 +79,10 @@ async def startup():
     redis = await aioredis.from_url(REDIS_URL, decode_responses=True)
     pg_pool = await asyncpg.create_pool(DATABASE_URL)
     
-    # Ensure Table Exists with ALL columns
+    # CHANGED: Table name is now 'rides_v2' to force a fresh schema creation
     async with pg_pool.acquire() as conn:
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS rides (
+            CREATE TABLE IF NOT EXISTS rides_v2 (
                 id SERIAL PRIMARY KEY,
                 rider_id INT,
                 driver_id INT,
@@ -102,7 +102,7 @@ async def shutdown():
     if redis: await redis.close()
     if pg_pool: await pg_pool.close()
 
-# --- API 1: REQUEST RIDE (Matching) ---
+# --- API 1: REQUEST RIDE ---
 @app.post("/v1/rides")
 async def create_ride(ride: RideRequest):
     nearest = await redis.geosearch(
@@ -114,9 +114,14 @@ async def create_ride(ride: RideRequest):
     driver_id = int(nearest[0])
     
     async with pg_pool.acquire() as conn:
+        # CHANGED: Fixed SQL to actually save pickup_lat and pickup_long
         row = await conn.fetchrow(
-            "INSERT INTO rides (rider_id, driver_id, status, fare) VALUES ($1, $2, 'ACCEPTED', 0) RETURNING id",
-            ride.rider_id, driver_id
+            """
+            INSERT INTO rides_v2 (rider_id, driver_id, pickup_lat, pickup_long, status, fare) 
+            VALUES ($1, $2, $3, $4, 'ACCEPTED', 0) 
+            RETURNING id
+            """,
+            ride.rider_id, driver_id, ride.pickup_lat, ride.pickup_long
         )
 
     msg = {"type": "RIDE_UPDATE", "ride_id": row['id'], "status": "ACCEPTED", "driver_id": driver_id, "detail": "Driver is on the way"}
@@ -127,27 +132,30 @@ async def create_ride(ride: RideRequest):
 @app.post("/v1/trips/{id}/start")
 async def start_trip(id: int):
     async with pg_pool.acquire() as conn:
-        await conn.execute("UPDATE rides SET status='IN_PROGRESS', start_time=NOW() WHERE id=$1", id)
+        # CHANGED: Table rides_v2
+        await conn.execute("UPDATE rides_v2 SET status='IN_PROGRESS', start_time=NOW() WHERE id=$1", id)
     
     msg = {"type": "RIDE_UPDATE", "ride_id": id, "status": "IN_PROGRESS", "detail": "Ride Started! Enjoy your trip."}
     await manager.broadcast(msg)
     return {"status": "started"}
 
-# --- API 3: END TRIP (Calc Fare) ---
+# --- API 3: END TRIP ---
 @app.post("/v1/trips/{id}/end")
 async def end_trip(id: int):
-    # Mocking a drop location (10km away) for fare calc
     drop_lat, drop_long = 13.0, 77.6 
     
     async with pg_pool.acquire() as conn:
-        # Fetch pickup location to calc distance
-        ride = await conn.fetchrow("SELECT pickup_lat, pickup_long FROM rides WHERE id=$1", id)
+        # CHANGED: Table rides_v2
+        ride = await conn.fetchrow("SELECT pickup_lat, pickup_long FROM rides_v2 WHERE id=$1", id)
         
-        dist_km = calculate_distance(ride['pickup_lat'], ride['pickup_long'], drop_lat, drop_long)
-        fare = round(50 + (dist_km * 12), 2) # Base 50 + 12 per km
+        if not ride: raise HTTPException(status_code=404, detail="Ride not found")
 
+        dist_km = calculate_distance(ride['pickup_lat'], ride['pickup_long'], drop_lat, drop_long)
+        fare = round(50 + (dist_km * 12), 2)
+
+        # CHANGED: Table rides_v2
         await conn.execute(
-            "UPDATE rides SET status='COMPLETED', end_time=NOW(), fare=$2 WHERE id=$1", 
+            "UPDATE rides_v2 SET status='COMPLETED', end_time=NOW(), fare=$2 WHERE id=$1", 
             id, fare
         )
     
@@ -158,14 +166,13 @@ async def end_trip(id: int):
 # --- API 4: PAYMENTS ---
 @app.post("/v1/payments")
 async def process_payment(action: TripAction):
-    # Mock External PSP Call
     import random
-    success = random.choice([True, True, True, False]) # 75% success rate
-    
+    success = random.choice([True, True, True, False]) 
     status = "PAID" if success else "FAILED"
     
     async with pg_pool.acquire() as conn:
-        await conn.execute("UPDATE rides SET payment_status=$2 WHERE id=$1", action.ride_id, status)
+        # CHANGED: Table rides_v2
+        await conn.execute("UPDATE rides_v2 SET payment_status=$2 WHERE id=$1", action.ride_id, status)
 
     msg = {"type": "RIDE_UPDATE", "ride_id": action.ride_id, "status": status, "detail": f"Payment {status}"}
     await manager.broadcast(msg)
@@ -208,24 +215,20 @@ async def get():
                 <button class="btn-req" onclick="requestRide()">1. Request Ride</button>
                 <div id="rider-status" style="margin-top:10px; color: #666;">Status: Idle</div>
             </div>
-
             <div class="card">
                 <h2>Driver App (Simulation)</h2>
                 <button class="btn-start" onclick="startTrip()">2. Start Trip</button>
                 <button class="btn-end" onclick="endTrip()">3. End Trip</button>
             </div>
-
             <div class="card">
                 <h2>Payments</h2>
                 <button class="btn-pay" onclick="pay()">4. Process Payment</button>
             </div>
-
             <div class="card" style="flex: 1;">
                 <h3>Live Logs</h3>
                 <div id="logs"></div>
             </div>
         </div>
-
         <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
         <script>
             const map = L.map('map').setView([12.9716, 77.5946], 13);
@@ -235,7 +238,6 @@ async def get():
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const ws = new WebSocket(`${{protocol}}//${{window.location.host}}/ws`);
 
-            // --- WEBSOCKET HANDLER ---
             ws.onmessage = (event) => {{
                 const data = JSON.parse(event.data);
                 log(data.type === 'RIDE_UPDATE' ? data.detail : `Driver ${{data.id}} Moved`);
@@ -251,10 +253,9 @@ async def get():
                 }}
             }};
 
-            // --- API CALLS ---
             async function requestRide() {{
                 try {{
-                    // Add a mock driver first to ensure match
+                    // Add a mock driver first
                     await fetch("/v1/drivers/101/location", {{
                         method: "POST", headers: {{"Content-Type": "application/json"}},
                         body: JSON.stringify({{ lat: 12.9716, long: 77.5946 }}) 
