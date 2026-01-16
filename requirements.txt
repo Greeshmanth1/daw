@@ -5,3 +5,4 @@ asyncpg
 websockets
 jinja2
 python-dotenv
+newrelic
